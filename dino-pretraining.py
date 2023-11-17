@@ -1,4 +1,5 @@
 import os
+import random
 
 import torch
 import torch.nn as nn
@@ -12,15 +13,47 @@ from tqdm import tqdm
 from torchvision.utils import make_grid
 
 
+class DataAugmentationDINO(object):
+    def __init__(self):
+        # apply gaussian blur, random crop
+        self.random_transform_1 = transforms.RandomApply([
+            transforms.GaussianBlur(kernel_size=11, sigma=(0.1, 2.0)),
+            transforms.RandomResizedCrop(size=28, scale=(0.6, 1.), antialias=True)
+        ], p=0.8)
+        # random affine
+        self.random_transform_2 = transforms.RandomApply([
+            transforms.RandomAffine(degrees=(-40, 40), translate=(0.3, 0.3))
+        ], p=0.8)
+        self.random_transform_3 = transforms.RandomApply([
+            transforms.RandomPerspective(distortion_scale=0.5, p=1.),
+        ], p=0.8)
+        self.random_transform_3 = transforms.RandomApply([
+            transforms.RandomRotation(degrees=(-60, 60))
+        ], p=0.8)
+        self.before_out = transforms.Compose([
+            transforms.Resize(28, antialias=None),
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,)),
+        ])
+        self.transforms = [
+            [self.random_transform_1],
+            [self.random_transform_2],
+            [self.random_transform_3],
+            [self.random_transform_1, self.random_transform_2],
+            [self.random_transform_1, self.random_transform_3],
+        ]
+        self.transforms = [transforms.Compose(t + [self.before_out]) for t in self.transforms]
+
+    def __call__(self, image):
+        crops = [x(image) for x in self.transforms]
+        return crops
+
+
 def load_mnist_data(batch_size=256):
     transform = transforms.Compose([transforms.ToTensor(),
                                     transforms.Resize(28, antialias=None),
                                     transforms.Normalize((0.1307,), (0.3081,))])
-    train_transform = transforms.Compose([transforms.RandomCrop(23, padding=7),
-                                          transforms.RandomAffine(degrees=20, translate=(0.1, 0.1)),
-                                          transforms.Resize(28, antialias=None),
-                                          transforms.ToTensor(),
-                                          transforms.Normalize((0.1307,), (0.3081,))])
+    train_transform = DataAugmentationDINO()
     # Load the training and test datasets
     train_dataset = datasets.MNIST('./data', train=True, download=True, transform=train_transform)
     train_t_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
@@ -45,9 +78,9 @@ class Net(nn.Module):
             nn.SiLU(),
         )
         self.fc = nn.Sequential(
-            nn.LazyLinear(256),
-            nn.LazyLinear(64),
-            nn.LazyLinear(128),
+            nn.LazyLinear(1024),
+            nn.LazyLinear(512),
+            nn.LazyLinear(1024),
         )
         self.flat = nn.Flatten()
         self.cls_head = nn.Sequential(
@@ -129,14 +162,14 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = Net().to(device)
 
-    writer = SummaryWriter('runs/wo_pretrain')
-    opti = torch.optim.SGD(model.parameters(), lr=1e-3)
-    # Train a model that without pretraining nor EMA
-    for epoch in range(20):
-        train_model_classification(model, train_loader, opti, device, epoch, writer)
-    writer.close()
-    # evaluate accuracy
-    eval_and_print(model, test_loader, device)
+    # writer = SummaryWriter('runs/wo_pretrain')
+    # opti = torch.optim.SGD(model.parameters(), lr=1e-3)
+    # # Train a model that without pretraining nor EMA
+    # for epoch in range(20):
+    #     train_model_classification(model, train_loader, opti, device, epoch, writer)
+    # writer.close()
+    # # evaluate accuracy
+    # eval_and_print(model, test_loader, device)
 
     writer = SummaryWriter('runs/pretrain')
     model = Net().to(device)
@@ -148,29 +181,31 @@ def main():
     t_iter = iter(train_t_loader)
 
     opti = torch.optim.SGD(model.parameters(), lr=5e-5)
-    dino_loss = DINOLoss(128)
-    for epoch in range(100):
+    dino_loss = DINOLoss(1024)
+    for epoch in range(500):
         loader = tqdm(train_loader, desc=f'Epoch {epoch}')
         embedding, ema_embedding, data, t_data = None, None, None, None
         loss = None
         for batch_idx, (data, target) in enumerate(loader):
-            embedding, _ = model(data.to(device))
+            embs = [model(d.to(device))[0] for d in data]
+            embedding = torch.cat(embs)
             with torch.no_grad():
                 t_data, _, t_iter = get_next_batch(t_iter, train_t_loader)
                 ema_embedding, _ = ema_model(t_data.to(device))
                 ema_embedding = dino_loss.sinkhorn_knopp_teacher(ema_embedding, 0.04)
 
-            loss = dino_loss([embedding], [ema_embedding])
+            loss = dino_loss(embs, [ema_embedding])
             loss.backward()
 
             # clip gradient
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 15)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
             opti.step()
 
             ema_update(model, ema_model, 0.994)
             loader.set_postfix(loss=loss.item())
 
-        data_grid = make_grid(denorm(data))
+        i = random.choice(range(len(data)))
+        data_grid = make_grid(denorm(data[i]))
         t_data_grid = make_grid(denorm(t_data))
         # Add the grid to TensorBoard
         writer.add_image('Original Images', data_grid, global_step=epoch)
@@ -186,8 +221,8 @@ def main():
     emb = []
     img = []
     meta = []
-    for batch_idx, (data, target) in enumerate(train_loader):
-        embedding = ema_model(data.to(device))
+    for batch_idx, (data, target) in enumerate(test_loader):
+        embedding, _ = ema_model(data.to(device))
         emb.append(embedding)
         img.append(denorm(data))
         meta.append(target)
