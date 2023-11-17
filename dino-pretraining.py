@@ -1,6 +1,5 @@
 import os
 import random
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -162,14 +161,14 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = Net().to(device)
 
-    # writer = SummaryWriter('runs/wo_pretrain')
-    # opti = torch.optim.SGD(model.parameters(), lr=1e-3)
-    # # Train a model that without pretraining nor EMA
-    # for epoch in range(20):
-    #     train_model_classification(model, train_loader, opti, device, epoch, writer)
-    # writer.close()
-    # # evaluate accuracy
-    # eval_and_print(model, test_loader, device)
+    writer = SummaryWriter('runs/wo_pretrain')
+    opti = torch.optim.SGD(model.parameters(), lr=1e-3)
+    # Train a model that without pretraining nor EMA
+    for epoch in range(20):
+        train_model_classification(model, test_loader, opti, device, epoch, writer)
+    writer.close()
+    # evaluate accuracy
+    eval_and_print(model, test_loader, device)
 
     writer = SummaryWriter('runs/pretrain')
     model = Net().to(device)
@@ -180,9 +179,9 @@ def main():
 
     t_iter = iter(train_t_loader)
 
-    opti = torch.optim.SGD(model.parameters(), lr=5e-5)
+    opti = torch.optim.SGD(model.parameters(), lr=1e-3)
     dino_loss = DINOLoss(1024)
-    for epoch in range(500):
+    for epoch in range(25):
         loader = tqdm(train_loader, desc=f'Epoch {epoch}')
         embedding, ema_embedding, data, t_data = None, None, None, None
         loss = None
@@ -197,7 +196,7 @@ def main():
             loss = dino_loss(embs, [ema_embedding])
             loss.backward()
 
-            # clip gradient
+            # clip gradient since i ran into NaN MANY times
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
             opti.step()
 
@@ -231,12 +230,16 @@ def main():
     writer.add_embedding(torch.cat(emb), metadata=torch.cat(meta), label_img=torch.cat(img))
     writer.close()
 
+    opti = torch.optim.SGD(model.parameters(), lr=1e-3)
     writer = SummaryWriter('runs/w_pretrain')
     # Train a model that without pretraining nor EMA
     for epoch in range(20):
-        train_model_classification(model, train_loader, opti, device, epoch, writer)
+        train_model_classification(model, test_loader, opti, device, epoch, writer)
     # evaluate accuracy
     eval_and_print(model, test_loader, device)
+    writer.close()
+    print('Finished, run tensorboard --logdir=runs to see the difference, and use PROJECTOR can visualize the '
+          'embedding')
 
 
 if __name__ == '__main__':
